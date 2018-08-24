@@ -1,5 +1,5 @@
 /*
- * SHM refclock for ntpd/chronyd to simulate leap second
+ * SHM/SOCK refclock for ntpd/chronyd to simulate leap second
  *
  * Copyright (C) 2015  Miroslav Lichvar <mlichvar@redhat.com>
  *
@@ -18,7 +18,9 @@
  */
 
 #include <sys/ipc.h>
+#include <sys/socket.h>
 #include <sys/shm.h>
+#include <sys/un.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
@@ -52,25 +54,52 @@ struct shmTime {
   int    dummy[8];
 };
 
+struct sock_sample {
+  struct timeval tv;
+  double offset;
+  int pulse;
+  int leap;
+  int _pad;
+  int magic;
+};
+
 int main(int argc, char **argv) {
-	struct shmTime *shm;
+	struct shmTime *shm = NULL;
+	struct sock_sample sock;
+	struct sockaddr_un sun;
 	struct timespec ts_ref, ts_system;
 	time_t offset;
-	int shmid, leap;
+	int shmid, leap, sock_fd = 0;
 
 	if (argc != 3) {
-		fprintf(stderr, "usage: %s shm-number secs-before-leap\n", argv[0]);
+		fprintf(stderr, "usage: %s shm-number|sock-path secs-before-leap\n", argv[0]);
 		return 1;
 	}
 
-	shmid = shmget(0x4e545030 + atoi(argv[1]), sizeof (struct shmTime), 0);
+	if (argv[1][0] != '/') {
+		shmid = shmget(0x4e545030 + atoi(argv[1]), sizeof (struct shmTime), 0);
 
-	if (shmid == -1)
-		return 1;
+		if (shmid == -1)
+			return 1;
 
-	shm = (struct shmTime *)shmat(shmid, 0, 0);
-	if (shm == (void *)-1)
-		return 1;
+		shm = (struct shmTime *)shmat(shmid, 0, 0);
+		if (shm == (void *)-1)
+			return 1;
+	} else {
+		sun.sun_family = AF_UNIX;
+		if (snprintf(sun.sun_path, sizeof sun.sun_path, "%s", argv[1]) >=
+				sizeof (sun.sun_path))
+			return 1;
+
+		sock_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+		if (sock_fd < 0)
+			return 1;
+
+		if (connect(sock_fd, (struct sockaddr *)&sun, sizeof (sun)) < 0) {
+			close(sock_fd);
+			return 1;
+		}
+	}
 
 	offset = 0;
 	leap = 1;
@@ -89,20 +118,36 @@ int main(int argc, char **argv) {
 
 		ts_ref.tv_sec += offset;
 
-		shm->valid = 0;
+		if (shm) {
+			shm->valid = 0;
 
-		shm->mode = 1;
-		shm->clockTimeStampSec = ts_ref.tv_sec;
-		shm->clockTimeStampUSec = ts_ref.tv_nsec / 1000;
-		shm->clockTimeStampNSec = ts_ref.tv_nsec;
-		shm->receiveTimeStampSec = ts_system.tv_sec;
-		shm->receiveTimeStampUSec = ts_system.tv_nsec / 1000;
-		shm->receiveTimeStampNSec = ts_system.tv_nsec;
-		shm->leap = leap;
-		shm->precision = -30;
+			shm->mode = 1;
+			shm->clockTimeStampSec = ts_ref.tv_sec;
+			shm->clockTimeStampUSec = ts_ref.tv_nsec / 1000;
+			shm->clockTimeStampNSec = ts_ref.tv_nsec;
+			shm->receiveTimeStampSec = ts_system.tv_sec;
+			shm->receiveTimeStampUSec = ts_system.tv_nsec / 1000;
+			shm->receiveTimeStampNSec = ts_system.tv_nsec;
+			shm->leap = leap;
+			shm->precision = -30;
 
-		shm->valid = 1;
-		shm->count++;
+			shm->valid = 1;
+			shm->count++;
+		} else {
+			sock.tv.tv_sec = ts_system.tv_sec;
+			sock.tv.tv_usec = ts_system.tv_nsec / 1000;
+			sock.offset = (ts_ref.tv_sec - ts_system.tv_sec) +
+				(ts_ref.tv_nsec - ts_system.tv_nsec) / 1e9;
+			sock.pulse = 0;
+			sock.leap = leap;
+			sock._pad = 0;
+			sock.magic = 0x534f434b;
+
+			if (send(sock_fd, &sock, sizeof sock, 0) != sizeof sock) {
+				fprintf(stderr, "Could not send sample: %m\n");
+				return 1;
+			}
+		}
 
 		printf("%6ld\t%+.9f\n", LEAP_TIME - ts_system.tv_sec,
 				(ts_ref.tv_sec - ts_system.tv_sec) +
